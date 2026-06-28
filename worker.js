@@ -410,6 +410,12 @@ def vpngate_fetch_loop():
                         n["ping"] = max(n["ping"], global_node_reservoir[n["ip"]]["ping"])
                     global_node_reservoir[n["ip"]] = n
             print(f"[*] ⚡ 节点库更新，当前囤积有效节点 -> {len(global_node_reservoir)} 个", flush=True)
+        else:
+            # FIX 3: 如果 VPNGate 接口被限流或不通，延长现有节点的生命周期，防止库干涸
+            with reservoir_lock:
+                now = time.time()
+                for n in global_node_reservoir.values():
+                    n["harvested_at"] = now
         time.sleep(300)
 
 def setup_routing(tun_name: str, table_id: int):
@@ -500,7 +506,7 @@ def connect_node(tun: Tunnel, node: dict):
             with state_lock:
                 tun.process = process
                 tun.node = node
-                tun.entry_ip = node["ip"]
+                # 此时不再需要赋 entry_ip，因为在 maintain_pool 里已提前锁住坑位
                 tun.egress_ip = egress_ip
                 tun.country = node["country"]
                 tun.connected_at = time.time()
@@ -609,9 +615,14 @@ def maintain_pool():
             for ip in stale_ips: global_node_reservoir.pop(ip, None)
 
         with state_lock:
-            main_dead = (tun_main.process is None or tun_main.process.poll() is not None or not tun_main.ready)
+            # FIX 2: 严格检测通道是否正在连接，防止由于尚未就绪导致的错误判死和秒切混乱
+            main_dead = False
+            if not tun_main.is_connecting:
+                if tun_main.process is None or tun_main.process.poll() is not None or not tun_main.ready:
+                    main_dead = True
+
             if main_dead:
-                if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None:
+                if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None and not tun_backup.is_connecting:
                     print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: 出口 {tun_backup.egress_ip or tun_backup.entry_ip}", flush=True)
                     # 状态互换 (身份对调)
                     tun_main, tun_backup = tun_backup, tun_main
@@ -637,13 +648,17 @@ def maintain_pool():
         if needs_main:
             node = get_best_candidate()
             if node:
-                with state_lock: tun_main.is_connecting = True
+                with state_lock: 
+                    tun_main.is_connecting = True
+                    tun_main.entry_ip = node["ip"] # FIX 1: 提前占住坑位，防止备用通道刚好获取到同样的 IP 导致死锁冲突
                 threading.Thread(target=connect_node, args=(tun_main, node,), daemon=True).start()
                 time.sleep(1)
         elif needs_backup:
             node = get_best_candidate()
             if node:
-                with state_lock: tun_backup.is_connecting = True
+                with state_lock: 
+                    tun_backup.is_connecting = True
+                    tun_backup.entry_ip = node["ip"] # FIX 1: 提前占住坑位
                 threading.Thread(target=connect_node, args=(tun_backup, node,), daemon=True).start()
 
         time.sleep(2)
